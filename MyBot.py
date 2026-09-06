@@ -1,38 +1,183 @@
 import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
-import asyncio
 import aiohttp
+from urllib.parse import quote
 
-import json
-import requests
-
-# Load token
 load_dotenv()
+
 TOKEN = os.getenv("DISCORD_TOKEN")
+RIOT_API_KEY = os.getenv("RIOT_API_KEY")
+RIOT_ID = os.getenv("RIOT_ID")
 
+# ──────────────────────────────────────────────
+# FORCÉ SUR EUW
+# ──────────────────────────────────────────────
+PLATFORM = "euw1"
+ROUTING = "europe"
 
-# Intents
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Load codes from file
-with open("ALLCODESRUST.txt", "r") as f:
-    all_codes = [line.strip() for line in f if line.strip()]
+listening = False
+target_channel_id = None
+target_user_id = None
+was_in_game = False
+player_puuid = None
+last_game_id = None
 
-available_codes = all_codes.copy()
-reserved_codes = {} 
 
-# #######################
-# START BOT
-# #######################
+# ──────────────────────────────────────────────
+# Riot API helpers (EUW only)
+# ──────────────────────────────────────────────
 
+async def get_account_by_riot_id(session: aiohttp.ClientSession, game_name: str, tag_line: str):
+    """Récupère le PUUID"""
+    url = f"https://{ROUTING}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}"
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+
+    async with session.get(url, headers=headers) as resp:
+        if resp.status == 200:
+            return await resp.json()
+        else:
+            text = await resp.text()
+            print(f"[Riot] Erreur {resp.status}: {text}")
+            return None
+
+
+async def is_in_game(session: aiohttp.ClientSession, puuid: str):
+    """
+    Check si le joueur est en partie.
+    Retourne (True, gameId) si en jeu, sinon (False, None)
+    """
+
+    url = f"https://{PLATFORM}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{puuid}"
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+
+    async with session.get(url, headers=headers) as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            return True, data.get("gameId")
+        elif resp.status == 404:
+            return False, None
+        else:
+            text = await resp.text()
+            print(f"[Spectator] Erreur {resp.status}: {text}")
+            return False, None
+
+
+# ──────────────────────────────────────────────
+# Background task
+# ──────────────────────────────────────────────
+
+@tasks.loop(seconds=45)
+async def check_game_status():
+    global was_in_game, last_game_id
+
+    if not listening or not player_puuid:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        in_game, game_id = await is_in_game(session, player_puuid)
+
+        if in_game and not was_in_game:
+            was_in_game = True
+            last_game_id = game_id
+
+            channel = bot.get_channel(target_channel_id)
+            if channel:
+                mention = f"<@{target_user_id}>" if target_user_id else ""
+                await channel.send(
+                    f"{mention} **{RIOT_ID}** vient de lancer une partie !\n"
+                    f"`Game ID: {game_id}`"
+                )
+            print(f"[INFO] Partie détectée : GameID {game_id}")
+
+        elif not in_game and was_in_game:
+            was_in_game = False
+            last_game_id = None
+            print("[INFO] Partie terminée")
+
+
+# ──────────────────────────────────────────────
+# Slash commands
+# ──────────────────────────────────────────────
+
+@bot.tree.command(name="start_listening", description="Commence à écouter le Riot ID (EUW uniquement)")
+@app_commands.describe(
+    channel="Channel où envoyer le ping",
+    user="Membre à ping"
+)
+async def start_listening(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    user: discord.Member = None
+):
+    global listening, target_channel_id, target_user_id, player_puuid, was_in_game
+
+    await interaction.response.defer(ephemeral=True)
+
+    if not RIOT_ID or "#" not in RIOT_ID:
+        await interaction.followup.send("RIOT_ID mal configuré", ephemeral=True)
+        return
+
+    game_name, tag_line = RIOT_ID.split("#", 1)
+
+    async with aiohttp.ClientSession() as session:
+        account = await get_account_by_riot_id(session, game_name, tag_line)
+        if not account:
+            await interaction.followup.send(f"Impossible de trouver le compte `{RIOT_ID}`", ephemeral=True)
+            return
+
+        player_puuid = account["puuid"]
+        print(f"[INFO] PUUID trouvé : {player_puuid}")
+
+    target_channel_id = channel.id
+    target_user_id = user.id if user else None
+    was_in_game = False
+    listening = True
+
+    if not check_game_status.is_running():
+        check_game_status.start()
+
+    mention = f"<@{user.id}>" if user else "personne"
+    await interaction.followup.send(
+        f"Écoute activée pour **{RIOT_ID}** (EUW uniquement)\n"
+        f"Channel : {channel.mention}\n"
+        f"Ping : {mention}",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="stop_listening", description="Arrête l'écoute")
+async def stop_listening(interaction: discord.Interaction):
+    global listening
+    listening = False
+    if check_game_status.is_running():
+        check_game_status.cancel()
+    await interaction.response.send_message("Écoute arrêtée.", ephemeral=True)
+
+
+@bot.tree.command(name="status", description="État actuel de l'écoute")
+async def status(interaction: discord.Interaction):
+    status_msg = (
+        f"**Écoute active :** {listening}\n"
+        f"**Riot ID :** `{RIOT_ID}`\n"
+        f"**Région :** `EUW1`\n"
+        f"**PUUID :** `{player_puuid}`\n"
+        f"**En partie actuellement :** {was_in_game}"
+    )
+    await interaction.response.send_message(status_msg, ephemeral=True)
+
+
+# ──────────────────────────────────────────────
+# Events
+# ──────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
@@ -44,100 +189,10 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
 
 
-# #######################
-# RUST RAID
-# #######################
-
-
-@bot.tree.command(name="coderaid", description="Attribue un code à raid depuis la liste")
-async def random_number(interaction: discord.Interaction):
-    global available_codes, reserved_codes
-
-    if not available_codes:
-        await interaction.response.send_message("✅ Tous les codes ont été attribués.", ephemeral=True)
-        return
-
-    user = interaction.user
-    await interaction.response.defer()
-
-    while available_codes:
-        code = available_codes.pop(0)
-
-        placeholder = await interaction.followup.send(f"{user.mention} Ton code : **{code}**", wait=True)
-        await asyncio.sleep(1)
-        await placeholder.add_reaction("✅") 
-
-        reserved_codes[placeholder.id] = code
-
-        def check(reaction, reacting_user):
-            return (
-                reaction.message.id == placeholder.id and
-                str(reaction.emoji) in ["✅", "🗿"] and
-                not reacting_user.bot
-            )
-
-        try:
-            reaction, reacting_user = await bot.wait_for("reaction_add", timeout=600.0, check=check)
-
-            if str(reaction.emoji) == "✅":
-                print(f"[LOG] {reacting_user.name} a validé le code : {code}")
-                del reserved_codes[placeholder.id]
-                await placeholder.delete()
-
-            elif str(reaction.emoji) == "🗿":
-                await interaction.channel.send(f"@everyone Le code de la base est : **{code}**")
-                print(f"[ALERTE] {reacting_user.name} a signalé le code comme celui de la base : {code}")
-                del reserved_codes[placeholder.id]
-                await placeholder.delete()
-
-        except asyncio.TimeoutError:
-            print(f"[LOG] Code {code} non validé → remis en circulation.")
-            available_codes.insert(0, code)
-            del reserved_codes[placeholder.id]
-            await placeholder.delete()
-            break
-
-    if not available_codes:
-        await interaction.followup.send("✅ Tous les codes ont été utilisés.")
-
-
-@bot.tree.command(name="resetcodes", description="Réinitialise tous les codes depuis le fichier")
-async def reset_codes(interaction: discord.Interaction):
-    global available_codes, reserved_codes, all_codes
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Seuls les administrateurs peuvent réinitialiser les codes.", ephemeral=True)
-        return
-
-    try:
-        with open("ALLCODESRUST.txt", "r") as f:
-            all_codes = [line.strip() for line in f if line.strip()]
-        available_codes = all_codes.copy()
-        reserved_codes.clear()
-        await interaction.response.send_message("🔁 Tous les codes ont été réinitialisés.") 
-        print("[LOG] Les codes ont été réinitialisés par un administrateur.")
-    except Exception as e:
-        await interaction.response.send_message(f"Erreur lors du chargement : {e}")
-
-
-@bot.tree.command(name="nbcodes", description="Affiche le nombre de codes disponibles")
-async def show_code_counts(interaction: discord.Interaction):
-    global available_codes, reserved_codes, all_codes
-
-    total = len(all_codes)
-    dispo = len(available_codes)
-    reserves = len(reserved_codes)
-
-    await interaction.response.send_message(
-        f"**État des codes :**\n"
-        f"Disponibles : `{dispo}`\n"
-        f"Réservés : `{reserves}`\n"
-        f"Total : `{total}`"
-    )
-
-# Start the bot
-print(f"[DEBUG] TOKEN: {TOKEN}")
-try:
-    bot.run(TOKEN)
-except Exception as e:
-    print(f"[CRITICAL ERROR] Le bot n’a pas pu démarrer : {e}")
+if __name__ == "__main__":
+    if not TOKEN:
+        print("[CRITICAL] DISCORD_TOKEN manquant")
+    elif not RIOT_API_KEY:
+        print("[CRITICAL] RIOT_API_KEY manquant")
+    else:
+        bot.run(TOKEN)
